@@ -17,6 +17,7 @@ public final class Config {
 
     private static final String REPO_PATH = "repo.path";
     private static final String POSTS_DIR = "posts.dir";
+    private static final String DRAFTS_DIR = "drafts.dir";
     private static final String IMAGES_DIR = "images.dir";
     private static final String DEFAULT_LAYOUT = "default.layout";
 
@@ -65,6 +66,11 @@ public final class Config {
     /** Pasta dos posts, relativa à raiz do repositório (padrão Jekyll: _posts). */
     public String getPostsDir() {
         return props.getProperty(POSTS_DIR, "_posts");
+    }
+
+    /** Pasta dos rascunhos, relativa à raiz do repositório (padrão Jekyll: _drafts). */
+    public String getDraftsDir() {
+        return props.getProperty(DRAFTS_DIR, "_drafts");
     }
 
     /** Pasta onde as imagens inseridas são copiadas, relativa à raiz do repositório. */

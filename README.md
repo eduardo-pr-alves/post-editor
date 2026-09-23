@@ -11,6 +11,12 @@ posts — e cada operação já faz **commit e push** automaticamente.
 - **Selecionar o repositório** do blog (pasta local clonada); a escolha fica salva.
 - **Novo post**: gera `_posts/AAAA-MM-DD-titulo-do-post.md` com o front matter
   (`layout`, `title`, `date`, `categories`, `tags`).
+- **Rascunhos** (`Ctrl+Shift+S`): salvam o post só no computador, na pasta
+  `_drafts` do Jekyll, sem commit nem push — o site não é alterado. Ao clicar em
+  **Salvar e publicar**, o rascunho vai para `_posts` (com suas imagens) e é
+  enviado ao GitHub. Em um post já publicado, **Salvar rascunho** grava as
+  alterações localmente sem publicar; a lista marca esses posts como
+  "não publicado" até a próxima publicação.
 - **Editar posts antigos**: a lista lateral mostra todos os posts (com busca).
   Campos extras do front matter (ex.: `image`, `permalink`) são preservados.
 - **Excluir posts**: remove o arquivo e a pasta de imagens do post.
@@ -25,7 +31,7 @@ posts — e cada operação já faz **commit e push** automaticamente.
   - **blocos de código** com linguagem (destaque de sintaxe no site)
   - citações, listas com marcadores, numeradas e de tarefas
   - linha horizontal, notas de rodapé e seções recolhíveis (`<details>`)
-  - atalhos: `Ctrl+S` publicar, `Ctrl+N` novo post, `Ctrl+B`, `Ctrl+I`, `Ctrl+K`,
+  - atalhos: `Ctrl+S` publicar, `Ctrl+Shift+S` salvar rascunho, `Ctrl+N` novo post, `Ctrl+B`, `Ctrl+I`, `Ctrl+K`,
     `Ctrl+Z`/`Ctrl+Y`
 - Log com a saída dos comandos git executados.
 
@@ -58,9 +64,10 @@ java -jar post-editor.jar
 1. Clique em **Abrir repositório...** e selecione a pasta do blog.
 2. Clique em **Novo post**, preencha título, categorias/tags e escreva em Markdown.
 3. Use a barra de ferramentas para inserir imagens, tabelas, código etc.
-4. Clique em **Salvar e publicar** (`Ctrl+S`). O GitHub Pages atualiza o site em
+4. Para continuar depois, clique em **Salvar rascunho** — nada é enviado ao site.
+5. Quando estiver pronto, clique em **Salvar e publicar** (`Ctrl+S`). O GitHub Pages atualiza o site em
    alguns instantes.
-5. Para editar, selecione um post na lista, altere e publique novamente.
+6. Para editar, selecione um post na lista, altere e publique novamente.
    Para remover, selecione e clique em **Excluir post**.
 
 As imagens locais são referenciadas como
@@ -74,6 +81,7 @@ As preferências ficam em `~/.post-editor.properties`. Além do repositório,
 
 ```properties
 posts.dir=_posts
+drafts.dir=_drafts
 images.dir=assets/images
 default.layout=post
 ```

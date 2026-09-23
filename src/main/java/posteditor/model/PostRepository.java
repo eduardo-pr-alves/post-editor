@@ -21,11 +21,13 @@ public class PostRepository {
 
     private final File root;
     private final String postsDir;
+    private final String draftsDir;
     private final String imagesDir;
 
-    public PostRepository(File root, String postsDir, String imagesDir) {
+    public PostRepository(File root, String postsDir, String draftsDir, String imagesDir) {
         this.root = root;
         this.postsDir = postsDir;
+        this.draftsDir = draftsDir;
         this.imagesDir = imagesDir;
     }
 
@@ -37,8 +39,23 @@ public class PostRepository {
         return new File(root, postsDir);
     }
 
+    public File getDraftsFolder() {
+        return new File(root, draftsDir);
+    }
+
+    /** Rascunhos (ordenados por nome) seguidos dos posts publicados (mais novos primeiro). */
     public List<Post> listPosts() throws IOException {
-        File folder = getPostsFolder();
+        List<Post> posts = new ArrayList<Post>();
+        for (File f : listMarkdown(getDraftsFolder(), false)) {
+            posts.add(load(f));
+        }
+        for (File f : listMarkdown(getPostsFolder(), true)) {
+            posts.add(load(f));
+        }
+        return posts;
+    }
+
+    private static List<File> listMarkdown(File folder, final boolean newestFirst) {
         File[] files = folder.listFiles(new FileFilter() {
             @Override
             public boolean accept(File f) {
@@ -52,48 +69,94 @@ public class PostRepository {
         Arrays.sort(files, new Comparator<File>() {
             @Override
             public int compare(File a, File b) {
-                return b.getName().compareTo(a.getName());
+                return newestFirst ? b.getName().compareTo(a.getName()) : a.getName().compareTo(b.getName());
             }
         });
-        List<Post> posts = new ArrayList<Post>();
-        for (File f : files) {
-            posts.add(load(f));
-        }
-        return posts;
+        return Arrays.asList(files);
     }
 
     public Post load(File file) throws IOException {
         String text = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
         Post post = Post.parse(text);
         post.setFile(file);
+        post.setDraft(sameFile(file.getParentFile(), getDraftsFolder()));
         return post;
     }
 
     /**
-     * Grava o post no disco. Posts novos recebem o nome AAAA-MM-DD-slug.md;
-     * posts existentes mantêm o nome do arquivo (para não quebrar links).
+     * Grava o post no disco, na pasta correspondente ao seu estado:
+     * rascunhos em _drafts/slug.md e posts em _posts/AAAA-MM-DD-slug.md.
+     *
+     * Posts que já estão na pasta certa mantêm o nome do arquivo (para não
+     * quebrar links). Quando o post muda de pasta (ex.: rascunho publicado),
+     * o arquivo antigo é apagado e as imagens são movidas para a pasta de
+     * imagens do novo nome, com os links do texto atualizados.
      */
     public File save(Post post) throws IOException {
-        File file = post.getFile();
-        if (file == null) {
-            File folder = getPostsFolder();
-            if (!folder.isDirectory() && !folder.mkdirs()) {
-                throw new IOException("Não foi possível criar a pasta " + folder);
-            }
-            file = uniqueFile(folder, baseName(post), ".md");
-            post.setFile(file);
+        File oldFile = post.getFile();
+        File folder = post.isDraft() ? getDraftsFolder() : getPostsFolder();
+        if (oldFile != null && sameFile(oldFile.getParentFile(), folder)) {
+            write(oldFile, post);
+            return oldFile;
         }
-        Files.write(file.toPath(), post.toMarkdown().getBytes(StandardCharsets.UTF_8));
+        String oldImages = imageFolderFor(post);
+        if (!folder.isDirectory() && !folder.mkdirs()) {
+            throw new IOException("Não foi possível criar a pasta " + folder);
+        }
+        String base = post.isDraft() ? slugify(post.getTitle()) : datedSlug(post);
+        File file = uniqueFile(folder, base, ".md");
+        post.setFile(file);
+        moveImages(post, oldImages, imageFolderFor(post));
+        write(file, post);
+        if (oldFile != null) {
+            Files.deleteIfExists(oldFile.toPath());
+        }
         return file;
     }
 
-    /** Nome base do arquivo (sem extensão) de um post: data + slug do título. */
+    private static void write(File file, Post post) throws IOException {
+        Files.write(file.toPath(), post.toMarkdown().getBytes(StandardCharsets.UTF_8));
+    }
+
+    /** Move as imagens de uma pasta para outra e atualiza os links no corpo do post. */
+    private void moveImages(Post post, String from, String to) throws IOException {
+        File source = new File(root, from);
+        if (from.equals(to) || !source.isDirectory()) {
+            return;
+        }
+        File target = new File(root, to);
+        if (!target.isDirectory() && !target.mkdirs()) {
+            throw new IOException("Não foi possível criar a pasta " + target);
+        }
+        File[] images = source.listFiles();
+        if (images != null) {
+            for (File img : images) {
+                if (img.isFile()) {
+                    Files.move(img.toPath(), new File(target, img.getName()).toPath(),
+                            StandardCopyOption.REPLACE_EXISTING);
+                }
+            }
+        }
+        source.delete();
+        post.setBody(post.getBody().replace(from + "/", to + "/"));
+    }
+
+    private static boolean sameFile(File a, File b) {
+        return a != null && b != null
+                && a.toPath().toAbsolutePath().normalize().equals(b.toPath().toAbsolutePath().normalize());
+    }
+
+    /** Nome base do arquivo (sem extensão); para posts ainda não salvos, data + slug do título. */
     public static String baseName(Post post) {
         if (post.getFile() != null) {
             String name = post.getFile().getName();
             int dot = name.lastIndexOf('.');
             return dot > 0 ? name.substring(0, dot) : name;
         }
+        return datedSlug(post);
+    }
+
+    private static String datedSlug(Post post) {
         String date = post.getDate().trim();
         String day = date.length() >= 10 ? date.substring(0, 10) : date;
         return day + "-" + slugify(post.getTitle());

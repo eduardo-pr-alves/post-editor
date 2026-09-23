@@ -42,6 +42,7 @@ import java.awt.GridBagLayout;
 import java.awt.Insets;
 import java.awt.Toolkit;
 import java.awt.event.ActionEvent;
+import java.awt.event.InputEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
 import java.io.File;
@@ -54,8 +55,10 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
 import java.util.Date;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 import java.util.concurrent.ExecutionException;
 
 /**
@@ -75,9 +78,11 @@ public class MainFrame extends JFrame {
     private boolean loading;
     private boolean busy;
     private boolean ignoreSelection;
-    /** Imagens copiadas para o repositório que ainda não foram publicadas. */
+    /** Imagens copiadas para um post que ainda não foi salvo (apagadas se ele for descartado). */
     private final List<String> pendingImages = new ArrayList<String>();
     private List<Post> allPosts = new ArrayList<Post>();
+    /** Arquivos de posts com alterações salvas localmente mas ainda não publicadas. */
+    private Set<String> unpublished = new HashSet<String>();
 
     private final DefaultListModel<Post> listModel = new DefaultListModel<Post>();
     private final JList<Post> postList = new JList<Post>(listModel);
@@ -111,6 +116,12 @@ public class MainFrame extends JFrame {
             newPost();
         }
     });
+    private final Action draftAction = action("Salvar rascunho",
+            "Salvar só no computador, sem commit nem push (Ctrl+Shift+S)", new Runnable() {
+                public void run() {
+                    saveDraft();
+                }
+            });
     private final Action publishAction = action("Salvar e publicar", "Salvar, fazer commit e push (Ctrl+S)",
             new Runnable() {
                 public void run() {
@@ -171,6 +182,7 @@ public class MainFrame extends JFrame {
         toolbar.add(syncAction);
         toolbar.addSeparator();
         toolbar.add(newAction);
+        toolbar.add(draftAction);
         toolbar.add(publishAction);
         toolbar.add(deleteAction);
         toolbar.addSeparator();
@@ -291,6 +303,9 @@ public class MainFrame extends JFrame {
         JComponent root = getRootPane();
         root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(KeyStroke.getKeyStroke('S', menu), "publish");
         root.getActionMap().put("publish", publishAction);
+        root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW)
+                .put(KeyStroke.getKeyStroke('S', menu | InputEvent.SHIFT_MASK), "draft");
+        root.getActionMap().put("draft", draftAction);
         root.getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(KeyStroke.getKeyStroke('N', menu), "new");
         root.getActionMap().put("new", newAction);
     }
@@ -350,7 +365,8 @@ public class MainFrame extends JFrame {
             @Override
             public void done(String warning) {
                 git = candidate;
-                repository = new PostRepository(dir, config.getPostsDir(), config.getImagesDir());
+                repository = new PostRepository(dir, config.getPostsDir(), config.getDraftsDir(),
+                        config.getImagesDir());
                 config.setRepoPath(dir);
                 config.save();
                 editor.setRenderer(new MarkdownRenderer(dir));
@@ -394,11 +410,22 @@ public class MainFrame extends JFrame {
             allPosts = new ArrayList<Post>();
             showError("Erro ao ler os posts", e);
         }
+        try {
+            unpublished = git.uncommittedPaths(config.getPostsDir());
+        } catch (IOException e) {
+            unpublished = new HashSet<String>();
+        }
         applyFilter();
-        if (!repository.getPostsFolder().isDirectory()) {
-            setStatus("A pasta " + config.getPostsDir() + " ainda não existe; ela será criada ao publicar o primeiro post.");
+        int drafts = 0;
+        for (Post p : allPosts) {
+            if (p.isDraft()) {
+                drafts++;
+            }
+        }
+        if (allPosts.isEmpty()) {
+            setStatus("Nenhum post ainda. Clique em \"Novo post\" para começar.");
         } else {
-            setStatus(allPosts.size() + " post(s) encontrados.");
+            setStatus((allPosts.size() - drafts) + " post(s) publicados e " + drafts + " rascunho(s).");
         }
         if (select != null) {
             for (int i = 0; i < listModel.size(); i++) {
@@ -476,8 +503,7 @@ public class MainFrame extends JFrame {
             layoutField.setText(post.getLayout());
             categoriesField.setText(Post.joinCommaList(post.getCategories()));
             tagsField.setText(Post.joinCommaList(post.getTags()));
-            fileLabel.setText(post.getFile() == null ? "(será criado ao publicar)"
-                    : repository.relativize(post.getFile()));
+            updateFileLabel();
             editor.setText(post.getBody());
             pendingImages.clear();
             dirty = false;
@@ -486,6 +512,19 @@ public class MainFrame extends JFrame {
             loading = false;
         }
         updateActions();
+    }
+
+    private void updateFileLabel() {
+        if (current == null) {
+            fileLabel.setText(" ");
+        } else if (current.getFile() == null) {
+            fileLabel.setText("(novo — ainda não salvo)");
+        } else if (current.isDraft()) {
+            fileLabel.setText(repository.relativize(current.getFile()) + "  (rascunho, não publicado)");
+        } else {
+            String path = repository.relativize(current.getFile());
+            fileLabel.setText(path + (unpublished.contains(path) ? "  (alterações não publicadas)" : ""));
+        }
     }
 
     private void clearEditor() {
@@ -520,19 +559,21 @@ public class MainFrame extends JFrame {
         ignoreSelection = false;
         loadPost(post);
         titleField.requestFocusInWindow();
-        setStatus("Novo post: preencha o título e escreva o conteúdo. Depois clique em \"Salvar e publicar\".");
+        setStatus("Novo post: escreva o conteúdo e use \"Salvar rascunho\" ou \"Salvar e publicar\".");
     }
 
-    private boolean fillPostFromForm() {
+    /** Copia o formulário para o post. Para publicar, título e data são obrigatórios. */
+    private boolean fillPostFromForm(boolean forPublish) {
         String title = titleField.getText().trim();
         String date = dateField.getText().trim();
-        if (title.isEmpty()) {
+        // Rascunhos aceitam título e data vazios; publicar exige os dois.
+        if (forPublish && title.isEmpty()) {
             JOptionPane.showMessageDialog(this, "Informe o título do post.", "Título obrigatório",
                     JOptionPane.WARNING_MESSAGE);
             titleField.requestFocusInWindow();
             return false;
         }
-        if (!date.matches("^\\d{4}-\\d{2}-\\d{2}.*")) {
+        if ((forPublish || !date.isEmpty()) && !date.matches("^\\d{4}-\\d{2}-\\d{2}.*")) {
             JOptionPane.showMessageDialog(this, "A data deve começar com AAAA-MM-DD (ex.: 2024-05-10 14:30:00 -0300).",
                     "Data inválida", JOptionPane.WARNING_MESSAGE);
             dateField.requestFocusInWindow();
@@ -547,42 +588,92 @@ public class MainFrame extends JFrame {
         return true;
     }
 
+    /**
+     * Salva apenas no computador, sem commit nem push. Posts novos viram
+     * rascunhos em _drafts; posts já publicados são salvos no lugar e ficam
+     * marcados como "alterações não publicadas" até a próxima publicação.
+     */
+    private boolean saveDraft() {
+        if (current == null || repository == null || !fillPostFromForm(false)) {
+            return false;
+        }
+        if (current.getFile() == null) {
+            current.setDraft(true);
+        }
+        String editorText = editor.getText();
+        File file;
+        try {
+            file = repository.save(current);
+        } catch (IOException e) {
+            showError("Erro ao salvar o rascunho", e);
+            return false;
+        }
+        loading = true;
+        try {
+            // O salvamento pode ter movido imagens e atualizado os links no texto
+            if (!current.getBody().equals(editorText)) {
+                editor.setText(current.getBody());
+            }
+        } finally {
+            loading = false;
+        }
+        pendingImages.clear();
+        dirty = false;
+        reloadPosts(null);
+        updateFileLabel();
+        String path = repository.relativize(file);
+        setStatus(current.isDraft()
+                ? "Rascunho salvo em " + path + " (somente no computador, não publicado)."
+                : "Alterações salvas em " + path + " sem publicar. Use \"Salvar e publicar\" para enviar ao site.");
+        return true;
+    }
+
     private void publish() {
-        if (current == null || repository == null || !fillPostFromForm()) {
+        if (current == null || repository == null || !fillPostFromForm(true)) {
             return;
         }
+        final File oldFile = current.getFile();
+        final String oldImages = repository.imageFolderFor(current);
+        final boolean wasDraft = current.isDraft();
+        current.setDraft(false);
         final File file;
         try {
             file = repository.save(current);
         } catch (IOException e) {
+            current.setDraft(wasDraft);
             showError("Erro ao salvar o arquivo", e);
             return;
         }
         final String postPath = repository.relativize(file);
-        final List<String> paths = new ArrayList<String>();
-        paths.add(postPath);
-        for (String img : pendingImages) {
-            if (new File(repository.getRoot(), img).exists()) {
-                paths.add(img);
+        final String imageFolder = repository.imageFolderFor(current);
+        final List<String> added = new ArrayList<String>();
+        added.add(postPath);
+        if (new File(repository.getRoot(), imageFolder).isDirectory()) {
+            added.add(imageFolder);
+        }
+        // Rascunho publicado: o arquivo em _drafts saiu do lugar (só é removido do git se estava versionado)
+        final List<String> removed = new ArrayList<String>();
+        if (oldFile != null && !oldFile.equals(file)) {
+            removed.add(repository.relativize(oldFile));
+            if (!oldImages.equals(imageFolder)) {
+                removed.add(oldImages);
             }
         }
+        pendingImages.clear();
         final String title = current.getTitle();
-        loading = true;
-        fileLabel.setText(postPath);
-        loading = false;
+        updateFileLabel();
 
         runInBackground("Publicando no GitHub...", new Task<Boolean>() {
             @Override
             public Boolean call() throws Exception {
                 boolean isNew = !git.isTracked(postPath);
                 String message = (isNew ? "Novo post: " : "Atualiza post: ") + title;
-                return git.commitAndPush(paths, false, message);
+                return git.commitAndPush(added, removed, message);
             }
 
             @Override
             public void done(Boolean committed) {
                 dirty = false;
-                pendingImages.clear();
                 reloadPosts(file);
                 setStatus(committed ? "Post \"" + title + "\" publicado com sucesso!"
                         : "Nenhuma alteração no post; repositório enviado ao GitHub.");
@@ -610,16 +701,18 @@ public class MainFrame extends JFrame {
             return;
         }
         final File file = current.getFile();
+        final boolean draft = current.isDraft();
         final String title = current.getTitle().isEmpty() ? file.getName() : current.getTitle();
         final String postPath = repository.relativize(file);
         final String imageFolder = repository.imageFolderFor(current);
         final boolean hasImages = new File(repository.getRoot(), imageFolder).isDirectory();
 
-        String msg = "Excluir o post \"" + title + "\"?\n\nArquivo: " + postPath
+        String msg = "Excluir o " + (draft ? "rascunho" : "post") + " \"" + title + "\"?\n\nArquivo: " + postPath
                 + (hasImages ? "\nImagens: " + imageFolder + "/" : "")
-                + "\n\nA exclusão será commitada e enviada ao GitHub.";
-        if (JOptionPane.showConfirmDialog(this, msg, "Excluir post", JOptionPane.YES_NO_OPTION,
-                JOptionPane.WARNING_MESSAGE) != JOptionPane.YES_OPTION) {
+                + (draft ? "\n\nO rascunho será apagado do computador."
+                         : "\n\nA exclusão será commitada e enviada ao GitHub.");
+        if (JOptionPane.showConfirmDialog(this, msg, draft ? "Excluir rascunho" : "Excluir post",
+                JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE) != JOptionPane.YES_OPTION) {
             return;
         }
         final List<String> paths = new ArrayList<String>();
@@ -627,11 +720,13 @@ public class MainFrame extends JFrame {
         if (hasImages) {
             paths.add(imageFolder);
         }
-        runInBackground("Excluindo post...", new Task<Boolean>() {
+        runInBackground(draft ? "Excluindo rascunho..." : "Excluindo post...", new Task<Boolean>() {
             @Override
             public Boolean call() throws Exception {
                 try {
-                    return git.commitAndPush(paths, true, "Remove post: " + title);
+                    // Rascunhos normalmente não estão no git; nesse caso nada é commitado nem enviado.
+                    return git.commitAndPush(new ArrayList<String>(), paths,
+                            (draft ? "Remove rascunho: " : "Remove post: ") + title);
                 } finally {
                     // Remove também arquivos que nunca foram versionados
                     for (String p : paths) {
@@ -644,7 +739,7 @@ public class MainFrame extends JFrame {
             public void done(Boolean committed) {
                 clearEditor();
                 reloadPosts(null);
-                setStatus("Post \"" + title + "\" excluído.");
+                setStatus((draft ? "Rascunho \"" : "Post \"") + title + "\" excluído.");
             }
 
             @Override
@@ -718,10 +813,15 @@ public class MainFrame extends JFrame {
         if (!dirty) {
             return true;
         }
-        int answer = JOptionPane.showConfirmDialog(this,
-                "O post atual tem alterações não publicadas. Deseja descartá-las?",
-                "Alterações não publicadas", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
-        if (answer == JOptionPane.YES_OPTION) {
+        Object[] options = {"Salvar rascunho", "Descartar", "Cancelar"};
+        int answer = JOptionPane.showOptionDialog(this,
+                "O post atual tem alterações que não foram salvas. O que deseja fazer?",
+                "Alterações não salvas", JOptionPane.YES_NO_CANCEL_OPTION, JOptionPane.WARNING_MESSAGE,
+                null, options, options[0]);
+        if (answer == 0) {
+            return saveDraft();
+        }
+        if (answer == 1) {
             if (current != null && current.getFile() == null && repository != null) {
                 deleteLocalImages(pendingImages);
             }
@@ -745,6 +845,7 @@ public class MainFrame extends JFrame {
         openRepoAction.setEnabled(!busy);
         syncAction.setEnabled(hasRepo);
         newAction.setEnabled(hasRepo);
+        draftAction.setEnabled(hasRepo && current != null);
         publishAction.setEnabled(hasRepo && current != null);
         deleteAction.setEnabled(hasRepo && current != null);
         postList.setEnabled(!busy);
@@ -847,7 +948,7 @@ public class MainFrame extends JFrame {
         }
     }
 
-    private static final class PostCellRenderer extends DefaultListCellRenderer {
+    private final class PostCellRenderer extends DefaultListCellRenderer {
         private static final long serialVersionUID = 1L;
 
         @Override
@@ -856,8 +957,15 @@ public class MainFrame extends JFrame {
             Post post = (Post) value;
             String title = MarkdownRenderer.escapeHtml(post.toString());
             String file = post.getFile() == null ? "" : MarkdownRenderer.escapeHtml(post.getFile().getName());
-            String html = "<html><b>" + title + "</b><br><font size=\"-2\" color=\""
-                    + (isSelected ? "#dddddd" : "#777777") + "\">" + file + "</font></html>";
+            String badge = "";
+            if (post.isDraft()) {
+                badge = "<font color=\"" + (isSelected ? "#ffe08a" : "#b35900") + "\">[Rascunho]</font> ";
+            } else if (post.getFile() != null && unpublished.contains(repository.relativize(post.getFile()))) {
+                badge = "<font color=\"" + (isSelected ? "#ffe08a" : "#b35900") + "\">&#8226;</font> ";
+            }
+            String html = "<html>" + badge + "<b>" + title + "</b><br><font size=\"-2\" color=\""
+                    + (isSelected ? "#dddddd" : "#777777") + "\">" + file
+                    + (!post.isDraft() && !badge.isEmpty() ? " — não publicado" : "") + "</font></html>";
             JLabel label = (JLabel) super.getListCellRendererComponent(list, html, index, isSelected, cellHasFocus);
             label.setBorder(BorderFactory.createEmptyBorder(4, 6, 4, 6));
             return label;

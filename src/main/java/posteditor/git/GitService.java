@@ -7,7 +7,9 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * Executa comandos do git instalado na máquina. As credenciais usadas no push
@@ -131,34 +133,31 @@ public class GitService {
     }
 
     /**
-     * Adiciona os caminhos, faz commit apenas deles e envia para o remoto.
+     * Adiciona/remove os caminhos, faz commit apenas deles e envia para o remoto.
      *
-     * @param paths   caminhos relativos à raiz do repositório
-     * @param removed se true, os caminhos são removidos do repositório (git rm)
+     * @param added   caminhos (relativos à raiz) a adicionar ou atualizar
+     * @param removed caminhos a remover do repositório (git rm); os não versionados são ignorados
      * @return false se não havia nada para commitar
      */
-    public boolean commitAndPush(List<String> requestedPaths, boolean removed, String message) throws IOException {
-        List<String> paths = new ArrayList<String>();
-        for (String p : requestedPaths) {
+    public boolean commitAndPush(List<String> added, List<String> removed, String message) throws IOException {
+        List<String> toRemove = new ArrayList<String>();
+        for (String p : removed) {
             // Só é possível remover/commitar pelo caminho o que o git já conhece.
-            if (!removed || isTracked(p)) {
-                paths.add(p);
+            if (isTracked(p)) {
+                toRemove.add(p);
             }
         }
+        List<String> paths = new ArrayList<String>(added);
+        paths.addAll(toRemove);
         if (paths.isEmpty()) {
-            log("Nenhum arquivo versionado a remover.");
+            log("Nenhum arquivo versionado a alterar.");
             return false;
         }
-        List<String> args = new ArrayList<String>();
-        if (removed) {
-            args.addAll(Arrays.asList("rm", "-r", "-f", "-q", "--ignore-unmatch", "--"));
-        } else {
-            args.addAll(Arrays.asList("add", "--"));
+        if (!toRemove.isEmpty()) {
+            stage(Arrays.asList("rm", "-r", "-f", "-q", "--ignore-unmatch", "--"), toRemove);
         }
-        args.addAll(paths);
-        Result stage = run(args);
-        if (!stage.ok()) {
-            throw new GitException("Falha ao preparar os arquivos:\n" + stage.output.trim());
+        if (!added.isEmpty()) {
+            stage(Arrays.asList("add", "--"), added);
         }
 
         List<String> diff = new ArrayList<String>(Arrays.asList("diff", "--cached", "--quiet", "--"));
@@ -178,6 +177,43 @@ public class GitService {
         }
         push();
         return committed;
+    }
+
+    private void stage(List<String> command, List<String> paths) throws IOException {
+        List<String> args = new ArrayList<String>(command);
+        args.addAll(paths);
+        Result r = run(args);
+        if (!r.ok()) {
+            throw new GitException("Falha ao preparar os arquivos:\n" + r.output.trim());
+        }
+    }
+
+    /**
+     * Caminhos (relativos à raiz, com "/") com alterações ainda não commitadas
+     * dentro das pastas informadas, incluindo arquivos novos.
+     */
+    public Set<String> uncommittedPaths(String... folders) throws IOException {
+        List<String> args = new ArrayList<String>(Arrays.asList("status", "--porcelain", "-uall", "--"));
+        args.addAll(Arrays.asList(folders));
+        Result r = run(args);
+        Set<String> paths = new HashSet<String>();
+        if (!r.ok()) {
+            return paths;
+        }
+        for (String line : r.output.split("\n")) {
+            if (line.length() > 3) {
+                String path = line.substring(3).trim();
+                int arrow = path.indexOf(" -> ");
+                if (arrow >= 0) {
+                    path = path.substring(arrow + 4);
+                }
+                if (path.startsWith("\"") && path.endsWith("\"")) {
+                    path = path.substring(1, path.length() - 1);
+                }
+                paths.add(path);
+            }
+        }
+        return paths;
     }
 
     public void push() throws IOException {

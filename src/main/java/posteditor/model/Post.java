@@ -17,6 +17,7 @@ public class Post {
     private static final String[] KNOWN_KEYS = {"layout", "title", "date", "categories", "tags"};
 
     private File file;
+    private boolean draft;
     private String title = "";
     private String date = "";
     private String layout = "post";
@@ -36,6 +37,15 @@ public class Post {
 
     public boolean isNew() {
         return file == null;
+    }
+
+    /** Rascunho: fica em _drafts, só no computador, e não é publicado no site. */
+    public boolean isDraft() {
+        return draft;
+    }
+
+    public void setDraft(boolean draft) {
+        this.draft = draft;
     }
 
     public String getTitle() {
