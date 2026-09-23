@@ -1,0 +1,11 @@
+build/
+target/
+out/
+*.class
+post-editor.jar
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
