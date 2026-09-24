@@ -17,6 +17,17 @@ posts — e cada operação já faz **commit e push** automaticamente.
   enviado ao GitHub. Em um post já publicado, **Salvar rascunho** grava as
   alterações localmente sem publicar; a lista marca esses posts como
   "não publicado" até a próxima publicação.
+- **Agendar publicação** (botão **Agendar...**): escolha data e hora e o post
+  é publicado automaticamente (commit + push) quando chegar o horário. Até lá
+  ele fica como rascunho, com o agendamento gravado no próprio arquivo
+  (`publish_at` no front matter). Na publicação, a `date` do post passa a ser a
+  data agendada.
+  - Ao fechar a janela, o Post Editor **continua rodando na bandeja do sistema**
+    (perto do relógio). Pelo ícone é possível reabrir a janela ou sair.
+  - Se o computador/aplicativo estiver desligado no horário, o post é publicado
+    assim que o Post Editor for aberto de novo.
+  - Se o envio falhar (ex.: sem internet), ele tenta de novo a cada 5 minutos.
+  - Posts já publicados não podem ser agendados, só novos posts e rascunhos.
 - **Editar posts antigos**: a lista lateral mostra todos os posts (com busca).
   Campos extras do front matter (ex.: `image`, `permalink`) são preservados.
 - **Excluir posts**: remove o arquivo e a pasta de imagens do post.
@@ -59,15 +70,27 @@ build.bat           # Windows
 java -jar post-editor.jar
 ```
 
+Para iniciar direto na bandeja (por exemplo, junto com o Windows), use:
+
+```bash
+java -jar post-editor.jar --bandeja
+```
+
+No Windows, crie um atalho com esse comando (usando `javaw` no lugar de `java`
+para não abrir um console) e coloque-o na pasta de inicialização
+(`Win+R` → `shell:startup`).
+
 ## Como usar
 
 1. Clique em **Abrir repositório...** e selecione a pasta do blog.
 2. Clique em **Novo post**, preencha título, categorias/tags e escreva em Markdown.
 3. Use a barra de ferramentas para inserir imagens, tabelas, código etc.
 4. Para continuar depois, clique em **Salvar rascunho** — nada é enviado ao site.
-5. Quando estiver pronto, clique em **Salvar e publicar** (`Ctrl+S`). O GitHub Pages atualiza o site em
+5. Para publicar mais tarde automaticamente, clique em **Agendar...** e escolha
+   a data e hora. Pode fechar a janela: o app fica na bandeja e publica no horário.
+6. Quando estiver pronto, clique em **Salvar e publicar** (`Ctrl+S`). O GitHub Pages atualiza o site em
    alguns instantes.
-6. Para editar, selecione um post na lista, altere e publique novamente.
+7. Para editar, selecione um post na lista, altere e publique novamente.
    Para remover, selecione e clique em **Excluir post**.
 
 As imagens locais são referenciadas como

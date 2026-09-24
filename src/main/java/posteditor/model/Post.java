@@ -14,12 +14,14 @@ import java.util.Map;
  */
 public class Post {
 
-    private static final String[] KNOWN_KEYS = {"layout", "title", "date", "categories", "tags"};
+    private static final String[] KNOWN_KEYS = {"layout", "title", "date", "publish_at", "categories", "tags"};
 
     private File file;
     private boolean draft;
     private String title = "";
     private String date = "";
+    /** Data/hora agendada para publicação automática (chave publish_at); vazio se não agendado. */
+    private String publishAt = "";
     private String layout = "post";
     private List<String> categories = new ArrayList<String>();
     private List<String> tags = new ArrayList<String>();
@@ -62,6 +64,18 @@ public class Post {
 
     public void setDate(String date) {
         this.date = date == null ? "" : date;
+    }
+
+    public String getPublishAt() {
+        return publishAt;
+    }
+
+    public void setPublishAt(String publishAt) {
+        this.publishAt = publishAt == null ? "" : publishAt.trim();
+    }
+
+    public boolean isScheduled() {
+        return !publishAt.isEmpty();
     }
 
     public String getLayout() {
@@ -163,6 +177,8 @@ public class Post {
             String rawEntry = e.getValue();
             if ("title".equals(key)) {
                 title = unquote(inlineValue(rawEntry));
+            } else if ("publish_at".equals(key)) {
+                publishAt = unquote(inlineValue(rawEntry));
             } else if ("date".equals(key)) {
                 date = unquote(inlineValue(rawEntry));
             } else if ("layout".equals(key)) {
@@ -266,6 +282,9 @@ public class Post {
         sb.append("title: ").append(quote(title)).append('\n');
         if (!date.trim().isEmpty()) {
             sb.append("date: ").append(date.trim()).append('\n');
+        }
+        if (!publishAt.isEmpty()) {
+            sb.append("publish_at: ").append(publishAt).append('\n');
         }
         if (!categories.isEmpty()) {
             sb.append("categories: ").append(formatList(categories)).append('\n');

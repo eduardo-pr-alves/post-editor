@@ -4,6 +4,7 @@ import posteditor.ui.MainFrame;
 
 import javax.swing.SwingUtilities;
 import javax.swing.UIManager;
+import java.util.Arrays;
 
 /**
  * Ponto de entrada do editor de posts para GitHub Pages.
@@ -19,11 +20,15 @@ public final class App {
         } catch (Exception ignored) {
             // Mantém o look and feel padrão
         }
+        // --bandeja: inicia só com o ícone na bandeja (ex.: ao ligar o computador)
+        final boolean startInTray = Arrays.asList(args).contains("--bandeja");
         SwingUtilities.invokeLater(new Runnable() {
             @Override
             public void run() {
                 MainFrame frame = new MainFrame(Config.load());
-                frame.setVisible(true);
+                if (!startInTray || !frame.hasTray()) {
+                    frame.setVisible(true);
+                }
             }
         });
     }

@@ -3,6 +3,7 @@ package posteditor.ui;
 import posteditor.Config;
 import posteditor.git.GitService;
 import posteditor.markdown.MarkdownRenderer;
+import posteditor.model.Dates;
 import posteditor.model.Post;
 import posteditor.model.PostRepository;
 
@@ -28,10 +29,12 @@ import javax.swing.KeyStroke;
 import javax.swing.ListSelectionModel;
 import javax.swing.SwingUtilities;
 import javax.swing.SwingWorker;
+import javax.swing.Timer;
 import javax.swing.event.DocumentEvent;
 import javax.swing.event.DocumentListener;
 import javax.swing.event.ListSelectionEvent;
 import javax.swing.event.ListSelectionListener;
+import java.awt.AWTException;
 import java.awt.BorderLayout;
 import java.awt.Component;
 import java.awt.Cursor;
@@ -40,8 +43,13 @@ import java.awt.Font;
 import java.awt.GridBagConstraints;
 import java.awt.GridBagLayout;
 import java.awt.Insets;
+import java.awt.MenuItem;
+import java.awt.PopupMenu;
+import java.awt.SystemTray;
 import java.awt.Toolkit;
+import java.awt.TrayIcon;
 import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
 import java.awt.event.InputEvent;
 import java.awt.event.WindowAdapter;
 import java.awt.event.WindowEvent;
@@ -83,6 +91,17 @@ public class MainFrame extends JFrame {
     private List<Post> allPosts = new ArrayList<Post>();
     /** Arquivos de posts com alterações salvas localmente mas ainda não publicadas. */
     private Set<String> unpublished = new HashSet<String>();
+
+    /** Intervalo entre as verificações de posts agendados. */
+    private static final int SCHEDULE_CHECK_MS = 30 * 1000;
+    /** Intervalo entre novas tentativas de push quando uma publicação agendada falha. */
+    private static final long PUSH_RETRY_INTERVAL_MS = 5 * 60 * 1000;
+    private TrayIcon trayIcon;
+    private boolean trayHintShown;
+    private boolean retryPushPending;
+    private long lastPushRetry;
+    /** Rascunhos agendados já avisados por terem alterações não salvas. */
+    private final Set<File> warnedDirty = new HashSet<File>();
 
     private final DefaultListModel<Post> listModel = new DefaultListModel<Post>();
     private final JList<Post> postList = new JList<Post>(listModel);
@@ -128,6 +147,12 @@ public class MainFrame extends JFrame {
                     publish();
                 }
             });
+    private final Action scheduleAction = action("Agendar...",
+            "Publicar automaticamente numa data e hora (salva como rascunho até lá)", new Runnable() {
+                public void run() {
+                    schedulePost();
+                }
+            });
     private final Action deleteAction = action("Excluir post", "Excluir o post, fazer commit e push", new Runnable() {
         public void run() {
             deletePost();
@@ -141,21 +166,30 @@ public class MainFrame extends JFrame {
         addWindowListener(new WindowAdapter() {
             @Override
             public void windowClosing(WindowEvent e) {
-                if (busy) {
-                    JOptionPane.showMessageDialog(MainFrame.this, "Aguarde a operação do git terminar.");
-                    return;
-                }
-                if (confirmDiscard()) {
-                    dispose();
-                    System.exit(0);
+                // Com bandeja disponível, fechar a janela só a esconde: os agendamentos continuam valendo.
+                if (trayIcon != null) {
+                    hideToTray();
+                } else {
+                    exitApplication();
                 }
             }
         });
+        setIconImages(AppIcon.allSizes());
 
         buildUi();
         installShortcuts();
+        installTray();
         setPostEditingEnabled(false);
         updateActions();
+
+        Timer scheduler = new Timer(SCHEDULE_CHECK_MS, new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                checkSchedules();
+            }
+        });
+        scheduler.setInitialDelay(5000);
+        scheduler.start();
 
         setSize(new Dimension(1300, 820));
         setLocationRelativeTo(null);
@@ -184,6 +218,7 @@ public class MainFrame extends JFrame {
         toolbar.add(newAction);
         toolbar.add(draftAction);
         toolbar.add(publishAction);
+        toolbar.add(scheduleAction);
         toolbar.add(deleteAction);
         toolbar.addSeparator();
         repoLabel.setBorder(BorderFactory.createEmptyBorder(0, 8, 0, 8));
@@ -427,6 +462,7 @@ public class MainFrame extends JFrame {
         } else {
             setStatus((allPosts.size() - drafts) + " post(s) publicados e " + drafts + " rascunho(s).");
         }
+        updateTrayTooltip();
         if (select != null) {
             for (int i = 0; i < listModel.size(); i++) {
                 File f = listModel.get(i).getFile();
@@ -520,7 +556,9 @@ public class MainFrame extends JFrame {
         } else if (current.getFile() == null) {
             fileLabel.setText("(novo — ainda não salvo)");
         } else if (current.isDraft()) {
-            fileLabel.setText(repository.relativize(current.getFile()) + "  (rascunho, não publicado)");
+            Date when = Dates.parse(current.getPublishAt());
+            fileLabel.setText(repository.relativize(current.getFile())
+                    + (when != null ? "  (agendado para " + Dates.toDisplay(when) + ")" : "  (rascunho, não publicado)"));
         } else {
             String path = repository.relativize(current.getFile());
             fileLabel.setText(path + (unpublished.contains(path) ? "  (alterações não publicadas)" : ""));
@@ -628,64 +666,373 @@ public class MainFrame extends JFrame {
         return true;
     }
 
+    /** Arquivos a commitar para publicar um post. */
+    private static final class PublishJob {
+        File file;
+        String postPath;
+        String title;
+        final List<String> added = new ArrayList<String>();
+        final List<String> removed = new ArrayList<String>();
+    }
+
+    /**
+     * Grava o post em _posts (movendo-o de _drafts, se for rascunho), remove o
+     * agendamento e calcula os caminhos que devem entrar no commit.
+     */
+    private PublishJob preparePublish(Post post) throws IOException {
+        File oldFile = post.getFile();
+        String oldImages = repository.imageFolderFor(post);
+        boolean wasDraft = post.isDraft();
+        String oldSchedule = post.getPublishAt();
+        post.setDraft(false);
+        post.setPublishAt("");
+        PublishJob job = new PublishJob();
+        try {
+            job.file = repository.save(post);
+        } catch (IOException e) {
+            post.setDraft(wasDraft);
+            post.setPublishAt(oldSchedule);
+            throw e;
+        }
+        job.postPath = repository.relativize(job.file);
+        job.title = post.getTitle();
+        String imageFolder = repository.imageFolderFor(post);
+        job.added.add(job.postPath);
+        if (new File(repository.getRoot(), imageFolder).isDirectory()) {
+            job.added.add(imageFolder);
+        }
+        // Rascunho publicado: o arquivo em _drafts saiu do lugar (só é removido do git se estava versionado)
+        if (oldFile != null && !oldFile.equals(job.file)) {
+            job.removed.add(repository.relativize(oldFile));
+            if (!oldImages.equals(imageFolder)) {
+                job.removed.add(oldImages);
+            }
+        }
+        return job;
+    }
+
+    private boolean commitPublish(PublishJob job) throws IOException {
+        boolean isNew = !git.isTracked(job.postPath);
+        String message = (isNew ? "Novo post: " : "Atualiza post: ") + job.title;
+        return git.commitAndPush(job.added, job.removed, message);
+    }
+
     private void publish() {
         if (current == null || repository == null || !fillPostFromForm(true)) {
             return;
         }
-        final File oldFile = current.getFile();
-        final String oldImages = repository.imageFolderFor(current);
-        final boolean wasDraft = current.isDraft();
-        current.setDraft(false);
-        final File file;
+        final PublishJob job;
         try {
-            file = repository.save(current);
+            job = preparePublish(current);
         } catch (IOException e) {
-            current.setDraft(wasDraft);
             showError("Erro ao salvar o arquivo", e);
             return;
         }
-        final String postPath = repository.relativize(file);
-        final String imageFolder = repository.imageFolderFor(current);
-        final List<String> added = new ArrayList<String>();
-        added.add(postPath);
-        if (new File(repository.getRoot(), imageFolder).isDirectory()) {
-            added.add(imageFolder);
-        }
-        // Rascunho publicado: o arquivo em _drafts saiu do lugar (só é removido do git se estava versionado)
-        final List<String> removed = new ArrayList<String>();
-        if (oldFile != null && !oldFile.equals(file)) {
-            removed.add(repository.relativize(oldFile));
-            if (!oldImages.equals(imageFolder)) {
-                removed.add(oldImages);
-            }
-        }
         pendingImages.clear();
-        final String title = current.getTitle();
         updateFileLabel();
 
         runInBackground("Publicando no GitHub...", new Task<Boolean>() {
             @Override
             public Boolean call() throws Exception {
-                boolean isNew = !git.isTracked(postPath);
-                String message = (isNew ? "Novo post: " : "Atualiza post: ") + title;
-                return git.commitAndPush(added, removed, message);
+                return commitPublish(job);
             }
 
             @Override
             public void done(Boolean committed) {
                 dirty = false;
-                reloadPosts(file);
-                setStatus(committed ? "Post \"" + title + "\" publicado com sucesso!"
+                reloadPosts(job.file);
+                setStatus(committed ? "Post \"" + job.title + "\" publicado com sucesso!"
                         : "Nenhuma alteração no post; repositório enviado ao GitHub.");
             }
 
             @Override
             public void failed(Exception e) {
                 dirty = false;
-                reloadPosts(file);
+                reloadPosts(job.file);
                 showError("O arquivo foi salvo localmente, mas a publicação falhou", e);
             }
         });
+    }
+
+    // ------------------------------------------------------------- agendamento
+
+    private void schedulePost() {
+        if (current == null || repository == null) {
+            return;
+        }
+        if (current.getFile() != null && !current.isDraft()) {
+            JOptionPane.showMessageDialog(this, "Este post já está publicado.\n"
+                    + "Só é possível agendar posts novos e rascunhos.", "Agendar publicação",
+                    JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+        String title = titleField.getText().trim();
+        if (title.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "Informe o título do post antes de agendar.", "Título obrigatório",
+                    JOptionPane.WARNING_MESSAGE);
+            titleField.requestFocusInWindow();
+            return;
+        }
+        ScheduleDialog dialog = ScheduleDialog.show(this, title, Dates.parse(current.getPublishAt()));
+        if (dialog.getChoice() == ScheduleDialog.Choice.CANCEL) {
+            return;
+        }
+        String previous = current.getPublishAt();
+        boolean schedule = dialog.getChoice() == ScheduleDialog.Choice.SCHEDULE;
+        current.setPublishAt(schedule ? Dates.toJekyll(dialog.getDate()) : "");
+        // O agendamento fica gravado no próprio rascunho (chave publish_at do front matter)
+        if (!saveDraft()) {
+            current.setPublishAt(previous);
+            return;
+        }
+        warnedDirty.remove(current.getFile());
+        updateTrayTooltip();
+        if (schedule) {
+            setStatus("Post \"" + title + "\" agendado para " + Dates.toDisplay(dialog.getDate())
+                    + ". Mantenha o Post Editor aberto (ele pode ficar na bandeja do sistema).");
+        } else {
+            setStatus("Agendamento removido; o post continua como rascunho.");
+        }
+    }
+
+    /** Executado periodicamente: publica os rascunhos cujo horário agendado já chegou. */
+    private void checkSchedules() {
+        if (repository == null || git == null || busy) {
+            return;
+        }
+        if (retryPushPending) {
+            if (System.currentTimeMillis() - lastPushRetry >= PUSH_RETRY_INTERVAL_MS) {
+                retryPush();
+            }
+            return;
+        }
+        List<Post> posts;
+        try {
+            posts = repository.listPosts();
+        } catch (IOException e) {
+            return;
+        }
+        Date now = new Date();
+        for (Post post : posts) {
+            Date when = post.isDraft() ? Dates.parse(post.getPublishAt()) : null;
+            if (when == null || when.after(now)) {
+                continue;
+            }
+            boolean isCurrent = current != null && post.getFile().equals(current.getFile());
+            if (isCurrent && dirty) {
+                // Não publica por cima de alterações que o usuário ainda não salvou
+                if (warnedDirty.add(post.getFile())) {
+                    notifyUser("Post agendado aguardando",
+                            "\"" + post.getTitle() + "\" tem alterações não salvas no editor. "
+                                    + "Salve o rascunho para que ele seja publicado.", TrayIcon.MessageType.WARNING);
+                }
+                continue;
+            }
+            publishScheduled(post, when, isCurrent);
+            return; // um por vez; os demais são publicados nas próximas verificações
+        }
+        updateTrayTooltip();
+    }
+
+    private void publishScheduled(Post post, Date when, final boolean isCurrent) {
+        if (post.getTitle().trim().isEmpty()) {
+            post.setTitle(post.getFile().getName());
+        }
+        post.setDate(Dates.toJekyll(when));
+        final PublishJob job;
+        try {
+            job = preparePublish(post);
+        } catch (IOException e) {
+            appendLog("Erro ao preparar post agendado: " + e.getMessage());
+            notifyUser("Falha no post agendado", e.getMessage(), TrayIcon.MessageType.ERROR);
+            return;
+        }
+        if (isCurrent) {
+            current = post;
+        }
+        appendLog("Publicando post agendado: " + job.title);
+        runInBackground("Publicando post agendado \"" + job.title + "\"...", new Task<Boolean>() {
+            @Override
+            public Boolean call() throws Exception {
+                return commitPublish(job);
+            }
+
+            @Override
+            public void done(Boolean committed) {
+                reloadPosts(isCurrent ? job.file : null);
+                updateTrayTooltip();
+                setStatus("Post agendado \"" + job.title + "\" publicado.");
+                notifyUser("Post publicado", "\"" + job.title + "\" foi publicado no GitHub Pages.",
+                        TrayIcon.MessageType.INFO);
+            }
+
+            @Override
+            public void failed(Exception e) {
+                // O post já está em _posts (e possivelmente commitado); o push é tentado de novo depois.
+                retryPushPending = true;
+                lastPushRetry = System.currentTimeMillis();
+                reloadPosts(isCurrent ? job.file : null);
+                updateTrayTooltip();
+                appendLog("Falha ao publicar post agendado: " + e.getMessage());
+                setStatus("Falha ao publicar o post agendado \"" + job.title + "\". Nova tentativa em alguns minutos.");
+                notifyUser("Falha ao publicar post agendado",
+                        "\"" + job.title + "\" não pôde ser enviado. O Post Editor tentará de novo em alguns "
+                                + "minutos. Veja o log para detalhes.", TrayIcon.MessageType.ERROR);
+            }
+        });
+    }
+
+    private void retryPush() {
+        lastPushRetry = System.currentTimeMillis();
+        runInBackground("Reenviando publicação pendente...", new Task<Void>() {
+            @Override
+            public Void call() throws Exception {
+                git.push();
+                return null;
+            }
+
+            @Override
+            public void done(Void result) {
+                retryPushPending = false;
+                reloadPosts(null);
+                setStatus("Publicação pendente enviada ao GitHub.");
+                notifyUser("Post publicado", "A publicação pendente foi enviada ao GitHub Pages.",
+                        TrayIcon.MessageType.INFO);
+            }
+
+            @Override
+            public void failed(Exception e) {
+                appendLog("Nova tentativa de push falhou: " + e.getMessage());
+                setStatus("Ainda não foi possível enviar a publicação pendente; nova tentativa em alguns minutos.");
+            }
+        });
+    }
+
+    /** Próximo rascunho agendado, ou null. */
+    private Post nextScheduled() {
+        Post next = null;
+        Date nextDate = null;
+        for (Post p : allPosts) {
+            Date d = p.isDraft() ? Dates.parse(p.getPublishAt()) : null;
+            if (d != null && (nextDate == null || d.before(nextDate))) {
+                next = p;
+                nextDate = d;
+            }
+        }
+        return next;
+    }
+
+    // ------------------------------------------------------------------ bandeja
+
+    private void installTray() {
+        if (!SystemTray.isSupported()) {
+            return;
+        }
+        PopupMenu menu = new PopupMenu();
+        MenuItem open = new MenuItem("Abrir Post Editor");
+        open.addActionListener(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                showWindow();
+            }
+        });
+        MenuItem exit = new MenuItem("Sair");
+        exit.addActionListener(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                exitApplication();
+            }
+        });
+        menu.add(open);
+        menu.addSeparator();
+        menu.add(exit);
+        TrayIcon icon = new TrayIcon(AppIcon.create(32), "Post Editor", menu);
+        icon.setImageAutoSize(true);
+        icon.addActionListener(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                showWindow();
+            }
+        });
+        try {
+            SystemTray.getSystemTray().add(icon);
+            trayIcon = icon;
+        } catch (AWTException e) {
+            trayIcon = null;
+        }
+    }
+
+    public boolean hasTray() {
+        return trayIcon != null;
+    }
+
+    private void showWindow() {
+        SwingUtilities.invokeLater(new Runnable() {
+            @Override
+            public void run() {
+                setVisible(true);
+                setExtendedState(getExtendedState() & ~ICONIFIED);
+                toFront();
+                requestFocus();
+            }
+        });
+    }
+
+    private void hideToTray() {
+        setVisible(false);
+        if (!trayHintShown) {
+            trayHintShown = true;
+            Post next = nextScheduled();
+            notifyUser("O Post Editor continua aberto",
+                    next == null ? "Ele fica na bandeja do sistema. Use o menu do ícone para abrir ou sair."
+                            : "Ele fica na bandeja e publicará os posts agendados no horário. "
+                            + "Use o menu do ícone para abrir ou sair.", TrayIcon.MessageType.INFO);
+        }
+    }
+
+    private void exitApplication() {
+        if (busy) {
+            showWindow();
+            JOptionPane.showMessageDialog(this, "Aguarde a operação do git terminar.");
+            return;
+        }
+        if (dirty) {
+            setVisible(true);
+        }
+        if (!confirmDiscard()) {
+            return;
+        }
+        if (nextScheduled() != null) {
+            setVisible(true);
+            int answer = JOptionPane.showConfirmDialog(this,
+                    "Há posts agendados. Se o Post Editor for fechado, eles só serão publicados\n"
+                            + "quando o aplicativo for aberto novamente. Deseja sair mesmo assim?",
+                    "Posts agendados", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+            if (answer != JOptionPane.YES_OPTION) {
+                return;
+            }
+        }
+        if (trayIcon != null) {
+            SystemTray.getSystemTray().remove(trayIcon);
+        }
+        dispose();
+        System.exit(0);
+    }
+
+    private void updateTrayTooltip() {
+        if (trayIcon == null) {
+            return;
+        }
+        Post next = nextScheduled();
+        trayIcon.setToolTip(next == null ? "Post Editor"
+                : "Post Editor — próximo agendado: " + next.getTitle() + " ("
+                + Dates.toDisplay(Dates.parse(next.getPublishAt())) + ")");
+    }
+
+    private void notifyUser(String caption, String text, TrayIcon.MessageType type) {
+        if (trayIcon != null) {
+            trayIcon.displayMessage(caption, text, type);
+        }
     }
 
     private void deletePost() {
@@ -847,6 +1194,7 @@ public class MainFrame extends JFrame {
         newAction.setEnabled(hasRepo);
         draftAction.setEnabled(hasRepo && current != null);
         publishAction.setEnabled(hasRepo && current != null);
+        scheduleAction.setEnabled(hasRepo && current != null && (current.getFile() == null || current.isDraft()));
         deleteAction.setEnabled(hasRepo && current != null);
         postList.setEnabled(!busy);
         String title = current == null ? "" : (dirty ? " *" : "");
@@ -958,8 +1306,12 @@ public class MainFrame extends JFrame {
             String title = MarkdownRenderer.escapeHtml(post.toString());
             String file = post.getFile() == null ? "" : MarkdownRenderer.escapeHtml(post.getFile().getName());
             String badge = "";
-            if (post.isDraft()) {
-                badge = "<font color=\"" + (isSelected ? "#ffe08a" : "#b35900") + "\">[Rascunho]</font> ";
+            Date scheduled = post.isDraft() ? Dates.parse(post.getPublishAt()) : null;
+            if (scheduled != null) {
+                badge = "<font color=\"" + (isSelected ? "#cce4ff" : "#0969da") + "\">[Agendado "
+                        + new SimpleDateFormat("dd/MM HH:mm").format(scheduled) + "]</font> ";
+            } else if (post.isDraft()) {
+                badge ="<font color=\"" + (isSelected ? "#ffe08a" : "#b35900") + "\">[Rascunho]</font> ";
             } else if (post.getFile() != null && unpublished.contains(repository.relativize(post.getFile()))) {
                 badge = "<font color=\"" + (isSelected ? "#ffe08a" : "#b35900") + "\">&#8226;</font> ";
             }
